@@ -5,7 +5,7 @@ from typing import Optional, Dict
 import logging
 
 # Assuming ask_agent is defined in agent.py
-from agent import ask_agent
+from backend.agent import ask_agent
 
 app = FastAPI()
 
