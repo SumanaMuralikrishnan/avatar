@@ -27,6 +27,10 @@ class ChatRequest(BaseModel):
     message: str
     user: Optional[Dict] = None  # Make user optional
 
+@app.get("/")
+def read_root():
+    return {"message": "FastAPI is live!"}
+
 @app.post("/ask_agent")
 def chat_with_agent(req: ChatRequest):
     try:
