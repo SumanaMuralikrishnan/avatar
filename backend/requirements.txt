@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+python-dotenv
+langchain
+langchain-openai
+langgraph
+psycopg2-binary
+requests
+python-dateutil
