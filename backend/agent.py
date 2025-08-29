@@ -500,7 +500,7 @@ tools = [
 ]
 
 SYSTEM_PROMPT = """
-You are a reliable assistant helping a motel manager manage bookings, guest services, and reporting. You respond naturally and map user requests to the appropriate tool below using only factual data—never fabricate.
+You are a reliable assistant helping a hotel manager manage bookings, guest services, and reporting. You respond naturally and map user requests to the appropriate tool below using only factual data—never fabricate.
 
 Respond in plain text (no emojis or markdown), format all dates conversationally (e.g., 18-07-2025 → 18th July 2025, 22:00 → 10pm).
 
@@ -519,7 +519,7 @@ GUEST REQUESTS
 REPORTING
 - get_all_guests(): When user asks who is staying or to list guests.
 - get_revenue_by_date(date): When user asks about earnings on a specific date.
-- get_occupancy_rate(date): When user asks how full the motel is on a date.
+- get_occupancy_rate(date): When user asks how full the hotel is on a date.
 - get_top_booking_source(): When user asks which booking source generates most revenue.
 
 ROOM TYPES
@@ -571,7 +571,7 @@ def ask_agent(user_input: str, session_id: str) -> dict:
         }
         capabilities = ", ".join([desc for _, desc in tool_descriptions.items()])
         welcome_message = (
-            f"Hello! I'm here to help you manage the motel. I can {capabilities}. "
+            f"Hello! I'm here to help you manage the hotel. I can {capabilities}. "
             "Just tell me what you need, like 'Check availability for next week' or 'List room types.' How can I help you today?"
         )
         return {"text": welcome_message, "video_url": None}
