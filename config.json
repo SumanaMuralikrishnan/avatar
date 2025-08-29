@@ -9,8 +9,8 @@
   "ttsVoice": "en-US-JennyNeural",
   "sttLocales": "en-US",
   "systemPrompt": "You are a helpful assistant.",
-  "azureOpenAIEndpoint": "https://voiceagentdemo-resource.services.ai.azure.com/",
-  "azureOpenAIApiKey": "Cz4BbPc7lZ9XlsBO0qUVgqLsvmoSa1Nq4dgoxmAurG7lFgVubdyTJQQJ99BHACHYHv6XJ3w3AAAAACOGowZU",
+  "azureOpenAIEndpoint": "",
+  "azureOpenAIApiKey": "",
   "azureOpenAIDeploymentName": "gpt-4o"
 }
 
