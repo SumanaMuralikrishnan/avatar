@@ -360,7 +360,7 @@ function handleUserQuery(userQuery) {
   }
 
   console.log("Sending request to /ask_agent...");
-  fetch("http://localhost:8000/ask_agent", {
+  fetch("https://avatar-v4ja.onrender.com/ask_agent", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
