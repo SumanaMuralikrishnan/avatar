@@ -649,8 +649,11 @@ collection = chroma_client.get_or_create_collection("documents")
  
  
 # Folder containing SOP files (.docx)
-DOC_FOLDER = Path(os.getenv("DOC_FOLDER", r"C:\Users\preethi.m\OneDrive - UB Technology Innovations, Inc\PowerAutomate & Copilot\Voice Avatar Agent\avatar\Hospitality Avatar Agent\backend\data"))
- 
+# DOC_FOLDER = Path(os.getenv("DOC_FOLDER", r"backend\data"))
+from pathlib import Path
+
+BASE_DIR = Path(__file__).resolve().parent      # directory containing this file
+DOC_FOLDER = BASE_DIR / "data"   
  
 text_splitter = RecursiveCharacterTextSplitter(
     chunk_size=500,
