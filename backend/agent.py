@@ -729,6 +729,7 @@ SYSTEM_PROMPT = """
 You are an assistant for retrieving SOP and procedural information.
 Whenever the user asks a question, call the rag_query tool.
 Do not guess. Use only the RAG tool output.
+The respons must not contain any markdown characters like "*", "#" or any emoji's.
 """
  
 agent_executor = create_react_agent(
