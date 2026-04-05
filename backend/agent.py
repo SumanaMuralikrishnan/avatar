@@ -1,57 +1,73 @@
-import json
 import os
 import logging
 from datetime import datetime, date
-from typing import Literal, Optional, Dict
+from typing import Optional
 from dotenv import load_dotenv
 from langchain_openai import AzureChatOpenAI
 from langchain_core.tools import tool
+from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.prebuilt import create_react_agent
 from dateutil import parser as date_parser
 import psycopg2
 
-# Setup logging
+# ---------------------------------------------------------------------------
+# SETUP
+# ---------------------------------------------------------------------------
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Load environment variables
 load_dotenv()
 
-# Memory setup
 memory = MemorySaver()
 
-# Azure OpenAI LLM
 llm = AzureChatOpenAI(
-    azure_endpoint=os.getenv('AZURE_OPENAI_ENDPOINT'),
-    openai_api_version=os.getenv('AZURE_API_VERSION'),
-    azure_deployment=os.getenv('AZURE_DEPLOYMENT_NAME'),
-    openai_api_key=os.getenv('AZURE_OPENAI_API_KEY'),
-    temperature=0.5
+    azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
+    openai_api_version=os.getenv("AZURE_API_VERSION"),
+    azure_deployment=os.getenv("AZURE_DEPLOYMENT_NAME"),
+    openai_api_key=os.getenv("AZURE_OPENAI_API_KEY"),
+    temperature=0.5,
 )
 
-def get_db_connection():
+# ---------------------------------------------------------------------------
+# DATABASE — resilient singleton connection
+# ---------------------------------------------------------------------------
+
+_connection: Optional[psycopg2.extensions.connection] = None
+
+
+def get_db_connection() -> psycopg2.extensions.connection:
+    """
+    Return a live psycopg2 connection.
+    Reconnects automatically if the connection is closed or dead.
+    """
+    global _connection
     try:
+        # Check if connection exists and is still alive
+        if _connection is None or _connection.closed:
+            raise psycopg2.OperationalError("Connection is None or closed.")
+        # Ping the server
+        with _connection.cursor() as cur:
+            cur.execute("SELECT 1")
+    except Exception:
+        # Reconnect
+        logger.info("Re-establishing database connection...")
         connection_string = os.getenv("DATABASE_URL")
         if not connection_string:
-            raise ValueError("DATABASE_URL environment variable is not set")
-        return psycopg2.connect(connection_string)
-    except psycopg2.OperationalError as e:
-        print(f"Database connection failed: {e}")
-        return None
+            raise ValueError("DATABASE_URL environment variable is not set.")
+        _connection = psycopg2.connect(connection_string)
+        logger.info("Database connection established.")
+    return _connection
 
-# Delay database connection until needed
-connection = None
 
-def get_db_connection_safe():
-    global connection
-    if connection is None:
-        connection = get_db_connection()
-    return connection
+# ---------------------------------------------------------------------------
+# HELPERS
+# ---------------------------------------------------------------------------
 
-def missing_param_response(param):
-    param_natural = param.replace("_", " ").capitalize()
-    return f"{param_natural} is missing. Could you please provide it?"
+def missing_param_response(param: str) -> str:
+    return f"{param.replace('_', ' ').capitalize()} is missing. Could you please provide it?"
+
 
 def parse_date(date_str: str) -> Optional[datetime]:
     """Parse a date string flexibly, assuming current or next year if not specified."""
@@ -59,80 +75,116 @@ def parse_date(date_str: str) -> Optional[datetime]:
         parsed = date_parser.parse(date_str, dayfirst=False)
         current_year = datetime.now().year
         if parsed.year < current_year:
-            parsed = parsed.replace(year=current_year if parsed.date() >= date.today() else current_year + 1)
+            parsed = parsed.replace(
+                year=current_year if parsed.date() >= date.today() else current_year + 1
+            )
         return parsed
     except ValueError:
         return None
 
-### Tool Definitions ###
+
+def fmt_date(dt: datetime) -> str:
+    """Format a datetime as e.g. '18th July 2025'."""
+    day = dt.day
+    suffix = (
+        "th" if 11 <= day <= 13
+        else {1: "st", 2: "nd", 3: "rd"}.get(day % 10, "th")
+    )
+    return dt.strftime(f"%-d{suffix} %B %Y")  # Linux; use %#d on Windows
+
+
+# ---------------------------------------------------------------------------
+# TOOLS
+# ---------------------------------------------------------------------------
 
 @tool
-def check_room_availability(check_in_date: str = None, check_out_date: str = None):
+def check_room_availability(check_in_date: str = None, check_out_date: str = None) -> str:
     """
     Check room availability for a given date range.
 
     Args:
-        check_in_date (str): Check-in date in any recognizable format (e.g., YYYY-MM-DD, 18th August).
-        check_out_date (str): Check-out date in any recognizable format.
+        check_in_date: Check-in date in any recognizable format (e.g. '2025-07-18', '18th July').
+        check_out_date: Check-out date in any recognizable format.
 
     Returns:
-        str: Available room numbers with room types or unavailability message.
+        Available room numbers with room types, or an unavailability message.
     """
     if not check_in_date:
         return missing_param_response("check_in_date")
     if not check_out_date:
         return missing_param_response("check_out_date")
-    
+
     check_in = parse_date(check_in_date)
     check_out = parse_date(check_out_date)
+
     if not check_in or not check_out:
-        return "Invalid date format. Please use a recognizable format like YYYY-MM-DD or 18th August."
+        return "Invalid date format. Please use a recognizable format like YYYY-MM-DD or '18th July'."
     if check_in.date() < date.today():
-        return f"Check-in date {check_in.strftime('%dth %B %Y').replace('0th', 'th')} is in the past. Please provide a future date."
+        return f"Check-in date {fmt_date(check_in)} is in the past. Please provide a future date."
     if check_out <= check_in:
         return "Check-out date must be after check-in date."
-    
+
     try:
-        conn = get_db_connection_safe()
-        with conn.cursor() as cursor:
-            cursor.execute("""
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
                 SELECT room_number, room_type
                 FROM public.dh_rooms
                 WHERE room_number NOT IN (
                     SELECT room_number
                     FROM public.dh_bookings
-                    WHERE (check_in_date <= %s AND check_out_date >= %s)
-                );
-            """, (check_out.strftime("%Y-%m-%d"), check_in.strftime("%Y-%m-%d")))
-            rooms = cursor.fetchall()
-            if not rooms:
-                return f"No rooms available between {check_in.strftime('%dth %B %Y').replace('0th', 'th')} and {check_out.strftime('%dth %B %Y').replace('0th', 'th')}."
-            room_list = [f"Room {row[0]} ({row[1]})" for row in rooms]
-            return f"Available rooms between {check_in.strftime('%dth %B %Y').replace('0th', 'th')} and {check_out.strftime('%dth %B %Y').replace('0th', 'th')}:\n" + ", ".join(room_list)
+                    WHERE check_in_date < %s AND check_out_date > %s
+                )
+                ORDER BY room_number;
+                """,
+                (check_out.strftime("%Y-%m-%d"), check_in.strftime("%Y-%m-%d")),
+            )
+            rooms = cur.fetchall()
+
+        if not rooms:
+            return f"No rooms available between {fmt_date(check_in)} and {fmt_date(check_out)}."
+
+        room_list = ", ".join(f"Room {r[0]} ({r[1]})" for r in rooms)
+        return f"Available rooms from {fmt_date(check_in)} to {fmt_date(check_out)}: {room_list}"
+
     except Exception as e:
-        return f"Error checking room availability: {str(e)}"
+        logger.error("check_room_availability error: %s", e, exc_info=True)
+        return f"Error checking room availability: {e}"
+
 
 @tool
-def book_room(guest_name: str = None, room_number: str = None, check_in_date: str = None, check_out_date: str = None, session_id: str = None):
+def book_room(
+    guest_name: str = None,
+    room_number: str = None,
+    check_in_date: str = None,
+    check_out_date: str = None,
+    config: RunnableConfig = None,
+) -> str:
     """
-    Book a room for a guest, automatically calculating the total amount based on room type and stay duration.
+    Book a room for a guest, automatically calculating the total amount.
 
     Args:
-        guest_name (str): Name of the guest.
-        room_number (str): Room number to book.
-        check_in_date (str): Check-in date in any recognizable format.
-        check_out_date (str): Check-out date in any recognizable format.
-        session_id (str): Session ID to retrieve stored guest name.
+        guest_name: Full name of the guest.
+        room_number: Room number to book.
+        check_in_date: Check-in date in any recognizable format.
+        check_out_date: Check-out date in any recognizable format.
 
     Returns:
-        str: Confirmation of booking with dates in conversational format.
+        Booking confirmation with dates and total cost.
     """
-    # Retrieve session-specific guest name if not provided
-    if not guest_name and session_id:
-        checkpoint = memory.get({"configurable": {"thread_id": session_id}})
-        if checkpoint and 'customer_name' in checkpoint.get('user_config', {}):
-            guest_name = checkpoint['user_config']['customer_name']
-    
+    # Retrieve guest_name from memory if not provided
+    if not guest_name and config:
+        session_id = config.get("configurable", {}).get("thread_id")
+        if session_id:
+            checkpoint = memory.get({"configurable": {"thread_id": session_id}})
+            if checkpoint:
+                guest_name = (
+                    checkpoint.get("channel_values", {})
+                    .get("user_config", {})
+                    .get("customer_name")
+                )
+
     if not guest_name:
         return missing_param_response("guest_name")
     if not room_number:
@@ -141,348 +193,428 @@ def book_room(guest_name: str = None, room_number: str = None, check_in_date: st
         return missing_param_response("check_in_date")
     if not check_out_date:
         return missing_param_response("check_out_date")
-    
+
     check_in = parse_date(check_in_date)
     check_out = parse_date(check_out_date)
+
     if not check_in or not check_out:
-        return "Invalid date format. Please use a recognizable format like YYYY-MM-DD or 18th August."
+        return "Invalid date format. Please use a recognizable format like YYYY-MM-DD or '18th July'."
     if check_in.date() < date.today():
-        return f"Check-in date {check_in.strftime('%dth %B %Y').replace('0th', 'th')} is in the past. Please provide a future date."
+        return f"Check-in date {fmt_date(check_in)} is in the past. Please provide a future date."
     if check_out <= check_in:
         return "Check-out date must be after check-in date."
-    
+
+    conn = None
     try:
+        conn = get_db_connection()
         nights = (check_out - check_in).days
-        conn = get_db_connection_safe()
-        with conn.cursor() as cursor:
-            cursor.execute("""
-                SELECT room_type
-                FROM public.dh_rooms
-                WHERE room_number = %s;
-            """, (room_number,))
-            room = cursor.fetchone()
+
+        with conn.cursor() as cur:
+            # Get room type
+            cur.execute(
+                "SELECT room_type FROM public.dh_rooms WHERE room_number = %s;",
+                (room_number,),
+            )
+            room = cur.fetchone()
             if not room:
                 return f"No room found with number {room_number}."
-            
-            room_type = room[0]
-            cursor.execute("""
-                SELECT rate_per_night
-                FROM public.dh_roomtypes
-                WHERE room_type = %s;
-            """, (room_type,))
-            rate = cursor.fetchone()
+
+            # Get rate
+            cur.execute(
+                "SELECT rate_per_night FROM public.dh_roomtypes WHERE room_type = %s;",
+                (room[0],),
+            )
+            rate = cur.fetchone()
             if not rate:
-                return f"No rate found for room type {room_type}."
-            
+                return f"No rate found for room type {room[0]}."
+
             total_amount = rate[0] * nights
-            cursor.execute("""
-                INSERT INTO public.dh_bookings (guest_name, room_number, check_in_date, check_out_date, total_amount, booking_date)
+
+            # Insert booking
+            cur.execute(
+                """
+                INSERT INTO public.dh_bookings
+                    (guest_name, room_number, check_in_date, check_out_date, total_amount, booking_date)
                 VALUES (%s, %s, %s, %s, %s, %s);
-            """, (guest_name, room_number, check_in.strftime("%Y-%m-%d"), check_out.strftime("%Y-%m-%d"), total_amount, datetime.now()))
+                """,
+                (
+                    guest_name,
+                    room_number,
+                    check_in.strftime("%Y-%m-%d"),
+                    check_out.strftime("%Y-%m-%d"),
+                    total_amount,
+                    datetime.now(),
+                ),
+            )
             conn.commit()
-            
-            # Update session memory with guest_name
-            if session_id:
-                checkpoint = memory.get({"configurable": {"thread_id": session_id}}) or {}
-                user_config = checkpoint.get('user_config', {})
-                user_config['customer_name'] = guest_name
-                memory.save({"configurable": {"thread_id": session_id}}, {'user_config': user_config})
-            
-            check_in_str = check_in.strftime("%dth %B %Y").replace("0th", "th")
-            check_out_str = check_out.strftime("%dth %B %Y").replace("0th", "th")
-            return f"Room {room_number} booked for {guest_name} from {check_in_str} to {check_out_str} for ${total_amount:.2f}."
+
+        return (
+            f"Room {room_number} booked for {guest_name} "
+            f"from {fmt_date(check_in)} to {fmt_date(check_out)} "
+            f"for ${total_amount:.2f}."
+        )
+
     except Exception as e:
-        conn.rollback()
-        return f"Error booking room {room_number}: {str(e)}"
+        if conn:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+        logger.error("book_room error: %s", e, exc_info=True)
+        return f"Error booking room {room_number}: {e}"
+
 
 @tool
-def raise_guest_request(room_number: str = None, request_description: str = "Guest request"):
+def raise_guest_request(room_number: str = None, request_description: str = "Guest request") -> str:
     """
     Raise a guest request ticket for a room.
 
     Args:
-        room_number (str): Room number.
-        request_description (str): Description of the guest request.
+        room_number: Room number raising the request.
+        request_description: Description of what the guest needs.
 
     Returns:
-        str: Confirmation message with date in conversational format. Returns the ticket ID as well.
+        Confirmation message with ticket ID.
     """
     if not room_number:
         return missing_param_response("room_number")
-    
+
+    conn = None
     try:
-        conn = get_db_connection_safe()
-        with conn.cursor() as cursor:
-            cursor.execute("""
-                INSERT INTO public.dh_tickets (room_number, request_description, status, assigned_to_department, created_at)
-                VALUES (%s, %s, %s, %s, %s)
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO public.dh_tickets
+                    (room_number, request_description, status, assigned_to_department, created_at)
+                VALUES (%s, %s, 'open', 'housekeeping', %s)
                 RETURNING id;
-            """, (room_number, request_description, "open", "housekeeping", datetime.now()))
-            
-            ticket_id = cursor.fetchone()[0]
+                """,
+                (room_number, request_description, datetime.now()),
+            )
+            ticket_id = cur.fetchone()[0]
             conn.commit()
-            
-            created_at = datetime.now().strftime("%dth %B %Y").replace("0th", "th")
-            return f"Guest request ticket #{ticket_id} raised for room {room_number} : {request_description}."
-    
+
+        return f"Guest request ticket #{ticket_id} raised for room {room_number}: {request_description}."
+
     except Exception as e:
-        conn.rollback()
-        return f"Error raising guest request for room {room_number}: {str(e)}"
+        if conn:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+        logger.error("raise_guest_request error: %s", e, exc_info=True)
+        return f"Error raising guest request for room {room_number}: {e}"
 
 
 @tool
-def view_guest_requests():
+def view_guest_requests() -> str:
     """
     View all open guest request tickets.
 
     Returns:
-        str: List of guest request ticket details with dates in conversational format.
+        List of open ticket details.
     """
     try:
-        conn = get_db_connection_safe()
-        with conn.cursor() as cursor:
-            cursor.execute("""
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
                 SELECT id, room_number, request_description, assigned_to_department, created_at
                 FROM public.dh_tickets
                 WHERE status = 'open'
                 ORDER BY created_at DESC;
-            """)
-            tickets = cursor.fetchall()
-            if not tickets:
-                return "No open guest requests found."
-            return "\n".join([
-                f"Ticket #{ticket[0]} - Room {ticket[1]}: {ticket[2]} (Assigned to {ticket[3]}, Created at {ticket[4].strftime('%dth %B %Y').replace('0th', 'th')})"
-                for ticket in tickets
-            ])
+                """
+            )
+            tickets = cur.fetchall()
+
+        if not tickets:
+            return "No open guest requests found."
+
+        return "\n".join(
+            f"Ticket #{t[0]} - Room {t[1]}: {t[2]} "
+            f"(Assigned to {t[3]}, Created {fmt_date(t[4])})"
+            for t in tickets
+        )
+
     except Exception as e:
-        return f"Error fetching guest requests: {str(e)}"
+        logger.error("view_guest_requests error: %s", e, exc_info=True)
+        return f"Error fetching guest requests: {e}"
+
 
 @tool
-def close_guest_request(ticket_id: int = None):
+def close_guest_request(ticket_id: int = None) -> str:
     """
     Close a guest request ticket by ID.
 
     Args:
-        ticket_id (int): Ticket number to be closed.
+        ticket_id: The ticket number to close.
 
     Returns:
-        str: Confirmation message.
+        Confirmation message.
     """
     if not ticket_id:
         return missing_param_response("ticket_id")
+
+    conn = None
     try:
-        conn = get_db_connection_safe()
-        with conn.cursor() as cursor:
-            cursor.execute("""
-                SELECT id
-                FROM public.dh_tickets
-                WHERE id = %s;
-            """, (ticket_id,))
-            if not cursor.fetchone():
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id FROM public.dh_tickets WHERE id = %s;", (ticket_id,)
+            )
+            if not cur.fetchone():
                 return f"No ticket found with ID {ticket_id}."
-            cursor.execute("""
-                UPDATE public.dh_tickets
-                SET status = 'closed'
-                WHERE id = %s;
-            """, (ticket_id,))
+
+            cur.execute(
+                "UPDATE public.dh_tickets SET status = 'closed' WHERE id = %s;",
+                (ticket_id,),
+            )
             conn.commit()
-            return f"Guest request ticket #{ticket_id} has been successfully closed."
+
+        return f"Guest request ticket #{ticket_id} has been successfully closed."
+
     except Exception as e:
-        conn.rollback()
-        return f"Error closing guest request #{ticket_id}: {str(e)}"
+        if conn:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+        logger.error("close_guest_request error: %s", e, exc_info=True)
+        return f"Error closing guest request #{ticket_id}: {e}"
+
 
 @tool
-def get_room_details(room_number: str = None):
+def get_room_details(room_number: str = None) -> str:
     """
     Get details of a specific room.
 
     Args:
-        room_number (str): Room number to query.
+        room_number: The room number to query.
 
     Returns:
-        str: Room details including type and status.
+        Room type and status.
     """
     if not room_number:
         return missing_param_response("room_number")
+
     try:
-        conn = get_db_connection_safe()
-        with conn.cursor() as cursor:
-            cursor.execute("""
-                SELECT room_number, room_type, status
-                FROM public.dh_rooms
-                WHERE room_number = %s;
-            """, (room_number,))
-            room = cursor.fetchone()
-            if room:
-                return f"Room {room[0]}: Type - {room[1]}, Status - {room[2]}"
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT room_number, room_type, status FROM public.dh_rooms WHERE room_number = %s;",
+                (room_number,),
+            )
+            room = cur.fetchone()
+
+        if not room:
             return f"No details found for room {room_number}."
+        return f"Room {room[0]}: Type - {room[1]}, Status - {room[2]}"
+
     except Exception as e:
-        return f"Error fetching details for room {room_number}: {str(e)}"
+        logger.error("get_room_details error: %s", e, exc_info=True)
+        return f"Error fetching details for room {room_number}: {e}"
+
 
 @tool
-def get_all_guests():
+def get_all_guests() -> str:
     """
     Get a list of all guests from booking records.
 
     Returns:
-        str: Guest names.
+        Distinct guest names.
     """
     try:
-        conn = get_db_connection_safe()
-        with conn.cursor() as cursor:
-            cursor.execute("""
-                SELECT DISTINCT guest_name
-                FROM public.dh_bookings;
-            """)
-            guests = cursor.fetchall()
-            if not guests:
-                return "No guest data found."
-            guests = [row[0] for row in guests]
-            return "Guests:\n" + ", ".join(guests)
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            cur.execute("SELECT DISTINCT guest_name FROM public.dh_bookings ORDER BY guest_name;")
+            guests = cur.fetchall()
+
+        if not guests:
+            return "No guest data found."
+        return "Guests: " + ", ".join(row[0] for row in guests)
+
     except Exception as e:
-        return f"Error fetching guests: {str(e)}"
+        logger.error("get_all_guests error: %s", e, exc_info=True)
+        return f"Error fetching guests: {e}"
+
 
 @tool
-def get_revenue_by_date(date: str = None):
+def get_revenue_by_date(date: str = None) -> str:
     """
-    Fetch revenue data for a specific date from bookings.
+    Fetch total revenue for rooms occupied on a specific date.
 
     Args:
-        date (str): The date in any recognizable format.
+        date: The date in any recognizable format.
 
     Returns:
-        str: Total revenue amount.
+        Total revenue amount for that date.
     """
     if not date:
         return missing_param_response("date")
+
     parsed_date = parse_date(date)
     if not parsed_date:
-        return "Invalid date format. Please use a recognizable format like YYYY-MM-DD or 18th August."
-    
+        return "Invalid date format. Please use a recognizable format like YYYY-MM-DD or '18th July'."
+
     try:
-        conn = get_db_connection_safe()
-        with conn.cursor() as cursor:
-            cursor.execute("""
-                SELECT total_amount
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            # Revenue = bookings where the guest was actually staying that night
+            cur.execute(
+                """
+                SELECT total_amount, check_in_date, check_out_date
                 FROM public.dh_bookings
-                WHERE booking_date = %s;
-            """, (parsed_date.strftime("%Y-%m-%d"),))
-            rows = cursor.fetchall()
-            if not rows:
-                return f"No revenue found on {parsed_date.strftime('%dth %B %Y').replace('0th', 'th')}."
-            total = sum(float(row[0]) for row in rows)
-            return f"Total revenue on {parsed_date.strftime('%dth %B %Y').replace('0th', 'th')}: ${total:.2f}"
+                WHERE check_in_date <= %s AND check_out_date > %s;
+                """,
+                (parsed_date.strftime("%Y-%m-%d"), parsed_date.strftime("%Y-%m-%d")),
+            )
+            rows = cur.fetchall()
+
+        if not rows:
+            return f"No revenue found for {fmt_date(parsed_date)}."
+
+        # Pro-rate each booking to a single night's contribution
+        total = sum(
+            float(row[0]) / max((row[2] - row[1]).days, 1)
+            for row in rows
+        )
+        return f"Total revenue on {fmt_date(parsed_date)}: ${total:.2f}"
+
     except Exception as e:
-        return f"Error fetching revenue for {parsed_date.strftime('%dth %B %Y').replace('0th', 'th')}: {str(e)}"
+        logger.error("get_revenue_by_date error: %s", e, exc_info=True)
+        return f"Error fetching revenue for {fmt_date(parsed_date)}: {e}"
+
 
 @tool
-def get_occupancy_rate(date: str = None):
+def get_occupancy_rate(date: str = None) -> str:
     """
     Calculate the occupancy rate for a specific date.
 
     Args:
-        date (str): The date in any recognizable format.
+        date: The date in any recognizable format.
 
     Returns:
-        str: Occupancy rate percentage.
+        Occupancy rate as a percentage.
     """
     if not date:
         return missing_param_response("date")
+
     parsed_date = parse_date(date)
     if not parsed_date:
-        return "Invalid date format. Please use a recognizable format like YYYY-MM-DD or 18th August."
-    
+        return "Invalid date format. Please use a recognizable format like YYYY-MM-DD or '18th July'."
+
     try:
-        conn = get_db_connection_safe()
-        with conn.cursor() as cursor:
-            cursor.execute("""
-                SELECT COUNT(*) FROM public.dh_rooms;
-            """)
-            total_rooms = cursor.fetchone()[0]
-            cursor.execute("""
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM public.dh_rooms;")
+            total_rooms = cur.fetchone()[0]
+
+            cur.execute(
+                """
                 SELECT COUNT(*)
                 FROM public.dh_bookings
-                WHERE %s BETWEEN check_in_date AND check_out_date;
-            """, (parsed_date.strftime("%Y-%m-%d"),))
-            occupied_rooms = cursor.fetchone()[0]
-            if total_rooms == 0:
-                return "No rooms registered in the system."
-            occupancy_rate = (occupied_rooms / total_rooms) * 100
-            return f"Occupancy rate on {parsed_date.strftime('%dth %B %Y').replace('0th', 'th')}: {occupancy_rate:.2f}%"
+                WHERE check_in_date <= %s AND check_out_date > %s;
+                """,
+                (parsed_date.strftime("%Y-%m-%d"), parsed_date.strftime("%Y-%m-%d")),
+            )
+            occupied_rooms = cur.fetchone()[0]
+
+        if total_rooms == 0:
+            return "No rooms registered in the system."
+
+        rate = (occupied_rooms / total_rooms) * 100
+        return f"Occupancy rate on {fmt_date(parsed_date)}: {rate:.2f}% ({occupied_rooms}/{total_rooms} rooms)"
+
     except Exception as e:
-        return f"Error calculating occupancy rate for {parsed_date.strftime('%dth %B %Y').replace('0th', 'th')}: {str(e)}"
+        logger.error("get_occupancy_rate error: %s", e, exc_info=True)
+        return f"Error calculating occupancy rate: {e}"
+
 
 @tool
-def get_top_booking_source():
+def get_top_booking_source() -> str:
     """
     Identify the booking source with the highest total revenue.
 
     Returns:
-        str: Booking source and revenue amount.
+        Top booking source and its revenue.
     """
     try:
-        conn = get_db_connection_safe()
-        with conn.cursor() as cursor:
-            cursor.execute("""
-                SELECT booking_source, SUM(total_amount)
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT booking_source, SUM(total_amount) AS total
                 FROM public.dh_bookings
-                GROUP BY booking_source;
-            """)
-            sources = cursor.fetchall()
-            if not sources:
-                return "No booking data found."
-            top_source = max(sources, key=lambda x: x[1])
-            return f"The top booking source is {top_source[0]} with ${top_source[1]:.2f} in revenue."
+                GROUP BY booking_source
+                ORDER BY total DESC
+                LIMIT 1;
+                """
+            )
+            row = cur.fetchone()
+
+        if not row:
+            return "No booking data found."
+        return f"Top booking source: {row[0]} with ${row[1]:.2f} in total revenue."
+
     except Exception as e:
-        return f"Error fetching top booking source: {str(e)}"
+        logger.error("get_top_booking_source error: %s", e, exc_info=True)
+        return f"Error fetching top booking source: {e}"
+
 
 @tool
-def list_room_types():
+def list_room_types() -> str:
     """
     List all room types and their rates per night.
 
     Returns:
-        str: List of room types with their rates.
+        Room types with nightly rates.
     """
     try:
-        conn = get_db_connection_safe()
-        with conn.cursor() as cursor:
-            cursor.execute("""
-                SELECT room_type, rate_per_night
-                FROM public.dh_roomtypes
-                ORDER BY room_type;
-            """)
-            room_types = cursor.fetchall()
-            if not room_types:
-                return "No room types found in the system."
-            return "\n".join([f"{row[0]}: ${row[1]:.2f} per night" for row in room_types])
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT room_type, rate_per_night FROM public.dh_roomtypes ORDER BY room_type;"
+            )
+            room_types = cur.fetchall()
+
+        if not room_types:
+            return "No room types found in the system."
+        return "\n".join(f"{row[0]}: ${row[1]:.2f} per night" for row in room_types)
+
     except Exception as e:
-        return f"Error fetching room types: {str(e)}"
-    
+        logger.error("list_room_types error: %s", e, exc_info=True)
+        return f"Error fetching room types: {e}"
+
+
 @tool
-def list_booking_sources():
+def list_booking_sources() -> str:
     """
-    List all booking sources.
+    List all distinct booking sources used in existing bookings.
 
     Returns:
-        str: List of booking sources.
+        Distinct booking sources.
     """
     try:
-        conn = get_db_connection_safe()
-        with conn.cursor() as cursor:
-            cursor.execute("""
-                SELECT booking_source
-                FROM public.dh_bookings;
-            """)
-            booking_source = cursor.fetchall()
-            if not booking_source:
-                return "No booking sources found in the system."
-            return "\n".join([row[0] for row in booking_source])
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT DISTINCT booking_source FROM public.dh_bookings ORDER BY booking_source;"
+            )
+            sources = cur.fetchall()
+
+        if not sources:
+            return "No booking sources found in the system."
+        return "Booking sources: " + ", ".join(row[0] for row in sources)
+
     except Exception as e:
-        return f"Error fetching booking sources: {str(e)}"
+        logger.error("list_booking_sources error: %s", e, exc_info=True)
+        return f"Error fetching booking sources: {e}"
 
 
-### AGENT CONFIGURATION ###
+# ---------------------------------------------------------------------------
+# AGENT CONFIGURATION
+# ---------------------------------------------------------------------------
 
 tools = [
     check_room_availability,
@@ -496,96 +628,148 @@ tools = [
     get_occupancy_rate,
     get_top_booking_source,
     list_room_types,
-    list_booking_sources
+    list_booking_sources,
 ]
 
-SYSTEM_PROMPT = """
-You are a reliable assistant helping a hotel manager manage bookings, guest services, and reporting. You respond naturally and map user requests to the appropriate tool below using only factual data—never fabricate.
+def get_system_prompt() -> str:
+    today = datetime.now().strftime("%A, %d %B %Y")  # e.g. "Sunday, 05 April 2026"
 
-Respond in plain text (no emojis or markdown), format all dates conversationally (e.g., 18-07-2025 → 18th July 2025, 22:00 → 10pm).
+return f"""
+You are a reliable assistant helping a hotel manager manage bookings, guest services, and reporting.
+You respond naturally and map user requests to the appropriate tool using only factual data — never fabricate.
+
+Respond in plain text (no emojis, no markdown). Format all dates conversationally (e.g. 18th July 2025).
 
 TOOLS AND WHEN TO USE THEM
 
 ROOM BOOKING
-- check_room_availability(check_in_date, check_out_date): When user asks about available rooms or date-based availability.
-- book_room(guest_name, room_number, check_in_date, check_out_date, session_id): When user wants to book a room. Use guest_name from session if not provided.
-- get_room_details(room_number): When user asks about a room’s status or details.
+- check_room_availability(check_in_date, check_out_date): User asks about available rooms for a date range.
+- book_room(guest_name, room_number, check_in_date, check_out_date): User wants to book a room.
+- get_room_details(room_number): User asks about a specific room's status or type.
 
 GUEST REQUESTS
-- raise_guest_request(room_number, request_description): When a guest needs something (e.g., extra towels). Prompt for room_number if missing.
-- view_guest_requests(): When user asks to list open guest requests.
-- close_guest_request(ticket_id): When user wants to close a guest request. Prompt if ID is missing.
+- raise_guest_request(room_number, request_description): Guest needs something (e.g. extra towels).
+- view_guest_requests(): User asks to see open requests.
+- close_guest_request(ticket_id): User wants to close a ticket.
 
 REPORTING
-- get_all_guests(): When user asks who is staying or to list guests.
-- get_revenue_by_date(date): When user asks about earnings on a specific date.
-- get_occupancy_rate(date): When user asks how full the hotel is on a date.
-- get_top_booking_source(): When user asks which booking source generates most revenue.
+- get_all_guests(): List all current guests.
+- get_revenue_by_date(date): Revenue for a specific date (rooms occupied that night).
+- get_occupancy_rate(date): How full the hotel is on a given date.
+- get_top_booking_source(): Which platform generates the most revenue.
 
 ROOM TYPES
-- list_room_types(): When user asks what kinds of rooms exist or their rates.
+- list_room_types(): User asks what room categories exist or their rates.
 
 BOOKING SOURCES
-- list_booking_sources() : When user asks how to book or what platforms or sources can be used to book a room.
+- list_booking_sources(): User asks what platforms or channels are used for bookings.
 
 MEMORY BEHAVIOR
-- Store and reuse last mentioned: room_number, guest_name, check_in_date, check_out_date, last_action.
-- Map pronouns like “it”, “that”, or “again” to the most recent context.
-  - "Book it again" → last room_number
-  - "Raise request for it" → last room_number
-  - "Book another room" → use last guest_name
+- Reuse the last mentioned room_number, guest_name, check_in_date, check_out_date across turns.
+- Map pronouns like "it", "that", or "again" to the most recent relevant context.
 
 DATE INTERPRETATION
-- If year is missing: assume current year if future date, next year if past.
-- Prompt for clarification if ambiguous.
+- If the year is missing, assume current year if the date is in the future, next year if it has already passed.
+- Ask for clarification if the date is genuinely ambiguous.
 
 GENERAL BEHAVIOR
-- Use only tool outputs.
+- Use only tool outputs. Never invent data.
 - Keep responses concise, factual, and clear.
-- Avoid unnecessary verbosity.
 """
 
+agent_executor = create_react_agent(
+    llm,
+    tools,
+    prompt=SYSTEM_PROMPT,
+    checkpointer=memory,
+    debug=False,
+)
 
-# Initialize agent with persistent memory
-agent_executor = create_react_agent(llm, tools, prompt=SYSTEM_PROMPT, checkpointer=memory, debug=False)
+
+# ---------------------------------------------------------------------------
+# MESSAGE HISTORY SANITIZER
+# ---------------------------------------------------------------------------
+
+def sanitize_message_history(config: dict) -> None:
+    """
+    Remove any AIMessages with tool_calls that have no matching ToolMessage.
+    This prevents INVALID_CHAT_HISTORY errors caused by interrupted tool executions.
+    """
+    from langchain_core.messages import AIMessage, ToolMessage
+
+    checkpoint = memory.get(config)
+    if not checkpoint:
+        return
+
+    messages = checkpoint.get("channel_values", {}).get("messages", [])
+    if not messages:
+        return
+
+    responded_ids = {
+        msg.tool_call_id
+        for msg in messages
+        if isinstance(msg, ToolMessage)
+    }
+
+    cleaned = []
+    dropped = False
+    for msg in messages:
+        if isinstance(msg, AIMessage) and msg.tool_calls:
+            unmatched = [tc for tc in msg.tool_calls if tc["id"] not in responded_ids]
+            if unmatched:
+                logger.warning(
+                    "Dropping AIMessage with unmatched tool calls: %s",
+                    [tc["name"] for tc in unmatched],
+                )
+                dropped = True
+                continue
+        cleaned.append(msg)
+
+    if dropped:
+        checkpoint["channel_values"]["messages"] = cleaned
+        memory.put(config, checkpoint, {})
+
+
+# ---------------------------------------------------------------------------
+# ENTRYPOINT
+# ---------------------------------------------------------------------------
+
+WELCOME_MESSAGE = (
+    "Hello! I am here to help you manage the hotel. I can check room availability, "
+    "book rooms for guests, raise and close guest requests, list room types and rates, "
+    "and pull reports on revenue, occupancy, guests, and booking sources. "
+    "Just tell me what you need. How can I help you today?"
+)
+
 
 def ask_agent(user_input: str, session_id: str) -> dict:
     """
-    Send a user message to the agent and get its response.
-    Handles 'hi' with a dynamic welcome message based on available tools.
+    Send a user message to the agent and return its response.
     """
+    if user_input.lower().strip() in {"hi", "hello", "hey"}:
+        return {"text": WELCOME_MESSAGE, "video_url": None}
+
     config = {"configurable": {"thread_id": session_id}}
-    if user_input.lower().strip() == "hi":
-        tool_descriptions = {
-            "check_room_availability": "check room availability for specific dates",
-            "book_room": "book rooms for guests",
-            "raise_guest_request": "raise guest requests like extra towels",
-            "view_guest_requests": "view open guest requests",
-            "close_guest_request": "close guest request tickets",
-            "get_room_details": "get details about a specific room",
-            "get_all_guests": "list all current guests",
-            "get_revenue_by_date": "check revenue for a specific date",
-            "get_occupancy_rate": "calculate occupancy rate for a date",
-            "get_top_booking_source": "find the top booking source by revenue",
-            "list_room_types": "list all room types and their rates"
-        }
-        capabilities = ", ".join([desc for _, desc in tool_descriptions.items()])
-        welcome_message = (
-            f"Hello! I'm here to help you manage the hotel. I can {capabilities}. "
-            "Just tell me what you need, like 'Check availability for next week' or 'List room types.' How can I help you today?"
-        )
-        return {"text": welcome_message, "video_url": None}
-    
+
+    # Sanitize history before invoking to prevent INVALID_CHAT_HISTORY
+    try:
+        sanitize_message_history(config)
+    except Exception as e:
+        logger.warning("Could not sanitize message history: %s", e)
+
     try:
         response = agent_executor.invoke(
-            {"messages": [{"role": "user", "content": user_input}], "session_id": session_id},
-            config=config
+            {
+                "messages": [{"role": "user", "content": user_input}],
+                "system": get_system_prompt(),   # ✅ fresh date every call
+            },
+            config=config,
         )
-        ans = str(response['messages'][-1].content).replace("*", "")
-        print(ans)
+        ans = str(response["messages"][-1].content).replace("*", "")
         return {"text": ans, "video_url": None}
+
     except Exception as e:
-        logger.error(f"Agent error: {e}", exc_info=True)
+        logger.error("Agent error: %s", e, exc_info=True)
         return {"text": f"Something went wrong: {e}", "video_url": None}
 ###############
 # import os
