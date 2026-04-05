@@ -12,6 +12,8 @@ from langgraph.checkpoint.memory import MemorySaver
 from langgraph.prebuilt import create_react_agent
 from dateutil import parser as date_parser
 import psycopg2
+from langchain_core.runnables import RunnableLambda
+
 
 # ---------------------------------------------------------------------------
 # SETUP
@@ -632,14 +634,9 @@ tools = [
     list_booking_sources,
 ]
 
-# ChatPromptTemplate lets us inject {today} fresh on every invoke call
-# without it ever being stored in MemorySaver's message history.
-# {messages} is required — it's the placeholder where LangGraph inserts
-# the full conversation history per thread.
-prompt = ChatPromptTemplate.from_messages([
-    (
-        "system",
-        """You are a reliable assistant helping a hotel manager manage bookings, guest services, and reporting.
+
+
+SYSTEM_PROMPT= """You are a reliable assistant helping a hotel manager manage bookings, guest services, and reporting.
 You respond naturally and map user requests to the appropriate tool using only factual data — never fabricate.
 
 Today's date is {today}. Use this when interpreting relative terms like "today", "tomorrow", \
@@ -684,15 +681,21 @@ DATE INTERPRETATION
 GENERAL BEHAVIOR
 - Use only tool outputs. Never invent data.
 - Keep responses concise, factual, and clear.
-""",
-    ),
-    ("placeholder", "{messages}"),  # LangGraph injects full conversation history here
-])
+"""
+
+def make_prompt(state: dict) -> list:
+    """
+    Called by LangGraph on every invoke.
+    Injects today's date into the system message fresh each time.
+    """
+    today = datetime.now().strftime("%A, %d %B %Y")
+    system_msg = SYSTEM_PROMPT.replace("{today}", today)
+    return [{"role": "system", "content": system_msg}] + state["messages"]
 
 agent_executor = create_react_agent(
     llm,
     tools,
-    prompt=prompt,
+    prompt=make_prompt,   # ✅ callable, not a template
     checkpointer=memory,
     debug=False,
 )
@@ -769,10 +772,7 @@ def ask_agent(user_input: str, session_id: str) -> dict:
 
     try:
         response = agent_executor.invoke(
-            {
-                "messages": [{"role": "user", "content": user_input}],
-                "today": datetime.now().strftime("%A, %d %B %Y"),  # e.g. "Sunday, 05 April 2026"
-            },
+            {"messages": [{"role": "user", "content": user_input}]},
             config=config,
         )
         ans = str(response["messages"][-1].content).replace("*", "")
