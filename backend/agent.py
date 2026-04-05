@@ -6,6 +6,8 @@ from dotenv import load_dotenv
 from langchain_openai import AzureChatOpenAI
 from langchain_core.tools import tool
 from langchain_core.runnables import RunnableConfig
+from langchain_core.messages import AIMessage, ToolMessage
+from langchain_core.prompts import ChatPromptTemplate
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.prebuilt import create_react_agent
 from dateutil import parser as date_parser
@@ -40,18 +42,16 @@ _connection: Optional[psycopg2.extensions.connection] = None
 def get_db_connection() -> psycopg2.extensions.connection:
     """
     Return a live psycopg2 connection.
-    Reconnects automatically if the connection is closed or dead.
+    Automatically reconnects if the connection is closed or dead.
     """
     global _connection
     try:
-        # Check if connection exists and is still alive
         if _connection is None or _connection.closed:
             raise psycopg2.OperationalError("Connection is None or closed.")
-        # Ping the server
+        # Ping to verify the connection is still alive
         with _connection.cursor() as cur:
             cur.execute("SELECT 1")
     except Exception:
-        # Reconnect
         logger.info("Re-establishing database connection...")
         connection_string = os.getenv("DATABASE_URL")
         if not connection_string:
@@ -84,13 +84,13 @@ def parse_date(date_str: str) -> Optional[datetime]:
 
 
 def fmt_date(dt: datetime) -> str:
-    """Format a datetime as e.g. '18th July 2025'."""
+    """Format a datetime as e.g. '5th April 2026'."""
     day = dt.day
     suffix = (
         "th" if 11 <= day <= 13
         else {1: "st", 2: "nd", 3: "rd"}.get(day % 10, "th")
     )
-    return dt.strftime(f"%-d{suffix} %B %Y")  # Linux; use %#d on Windows
+    return f"{day}{suffix} {dt.strftime('%B %Y')}"
 
 
 # ---------------------------------------------------------------------------
@@ -143,7 +143,7 @@ def check_room_availability(check_in_date: str = None, check_out_date: str = Non
             rooms = cur.fetchall()
 
         if not rooms:
-            return f"No rooms available between {fmt_date(check_in)} and {fmt_date(check_out)}."
+            return f"No rooms available from {fmt_date(check_in)} to {fmt_date(check_out)}."
 
         room_list = ", ".join(f"Room {r[0]} ({r[1]})" for r in rooms)
         return f"Available rooms from {fmt_date(check_in)} to {fmt_date(check_out)}: {room_list}"
@@ -173,7 +173,7 @@ def book_room(
     Returns:
         Booking confirmation with dates and total cost.
     """
-    # Retrieve guest_name from memory if not provided
+    # Retrieve guest_name from conversation memory if not provided by the LLM
     if not guest_name and config:
         session_id = config.get("configurable", {}).get("thread_id")
         if session_id:
@@ -210,7 +210,6 @@ def book_room(
         nights = (check_out - check_in).days
 
         with conn.cursor() as cur:
-            # Get room type
             cur.execute(
                 "SELECT room_type FROM public.dh_rooms WHERE room_number = %s;",
                 (room_number,),
@@ -219,7 +218,6 @@ def book_room(
             if not room:
                 return f"No room found with number {room_number}."
 
-            # Get rate
             cur.execute(
                 "SELECT rate_per_night FROM public.dh_roomtypes WHERE room_type = %s;",
                 (room[0],),
@@ -230,7 +228,6 @@ def book_room(
 
             total_amount = rate[0] * nights
 
-            # Insert booking
             cur.execute(
                 """
                 INSERT INTO public.dh_bookings
@@ -393,7 +390,7 @@ def get_room_details(room_number: str = None) -> str:
         room_number: The room number to query.
 
     Returns:
-        Room type and status.
+        Room type and current status.
     """
     if not room_number:
         return missing_param_response("room_number")
@@ -427,7 +424,9 @@ def get_all_guests() -> str:
     try:
         conn = get_db_connection()
         with conn.cursor() as cur:
-            cur.execute("SELECT DISTINCT guest_name FROM public.dh_bookings ORDER BY guest_name;")
+            cur.execute(
+                "SELECT DISTINCT guest_name FROM public.dh_bookings ORDER BY guest_name;"
+            )
             guests = cur.fetchall()
 
         if not guests:
@@ -440,27 +439,26 @@ def get_all_guests() -> str:
 
 
 @tool
-def get_revenue_by_date(date: str = None) -> str:
+def get_revenue_by_date(query_date: str = None) -> str:
     """
-    Fetch total revenue for rooms occupied on a specific date.
+    Fetch total revenue for rooms that were occupied on a specific date.
 
     Args:
-        date: The date in any recognizable format.
+        query_date: The date in any recognizable format.
 
     Returns:
-        Total revenue amount for that date.
+        Total pro-rated revenue for that night.
     """
-    if not date:
-        return missing_param_response("date")
+    if not query_date:
+        return missing_param_response("query_date")
 
-    parsed_date = parse_date(date)
+    parsed_date = parse_date(query_date)
     if not parsed_date:
         return "Invalid date format. Please use a recognizable format like YYYY-MM-DD or '18th July'."
 
     try:
         conn = get_db_connection()
         with conn.cursor() as cur:
-            # Revenue = bookings where the guest was actually staying that night
             cur.execute(
                 """
                 SELECT total_amount, check_in_date, check_out_date
@@ -487,20 +485,20 @@ def get_revenue_by_date(date: str = None) -> str:
 
 
 @tool
-def get_occupancy_rate(date: str = None) -> str:
+def get_occupancy_rate(query_date: str = None) -> str:
     """
     Calculate the occupancy rate for a specific date.
 
     Args:
-        date: The date in any recognizable format.
+        query_date: The date in any recognizable format.
 
     Returns:
         Occupancy rate as a percentage.
     """
-    if not date:
-        return missing_param_response("date")
+    if not query_date:
+        return missing_param_response("query_date")
 
-    parsed_date = parse_date(date)
+    parsed_date = parse_date(query_date)
     if not parsed_date:
         return "Invalid date format. Please use a recognizable format like YYYY-MM-DD or '18th July'."
 
@@ -524,7 +522,10 @@ def get_occupancy_rate(date: str = None) -> str:
             return "No rooms registered in the system."
 
         rate = (occupied_rooms / total_rooms) * 100
-        return f"Occupancy rate on {fmt_date(parsed_date)}: {rate:.2f}% ({occupied_rooms}/{total_rooms} rooms)"
+        return (
+            f"Occupancy rate on {fmt_date(parsed_date)}: "
+            f"{rate:.2f}% ({occupied_rooms}/{total_rooms} rooms occupied)"
+        )
 
     except Exception as e:
         logger.error("get_occupancy_rate error: %s", e, exc_info=True)
@@ -537,7 +538,7 @@ def get_top_booking_source() -> str:
     Identify the booking source with the highest total revenue.
 
     Returns:
-        Top booking source and its revenue.
+        Top booking source and its total revenue.
     """
     try:
         conn = get_db_connection()
@@ -631,55 +632,67 @@ tools = [
     list_booking_sources,
 ]
 
-def get_system_prompt() -> str:
-    today = datetime.now().strftime("%A, %d %B %Y")  # e.g. "Sunday, 05 April 2026"
-    return f"""
-    You are a reliable assistant helping a hotel manager manage bookings, guest services, and reporting.
-    You respond naturally and map user requests to the appropriate tool using only factual data — never fabricate.
-    
-    Respond in plain text (no emojis, no markdown). Format all dates conversationally (e.g. 18th July 2025).
-    
-    TOOLS AND WHEN TO USE THEM
-    
-    ROOM BOOKING
-    - check_room_availability(check_in_date, check_out_date): User asks about available rooms for a date range.
-    - book_room(guest_name, room_number, check_in_date, check_out_date): User wants to book a room.
-    - get_room_details(room_number): User asks about a specific room's status or type.
-    
-    GUEST REQUESTS
-    - raise_guest_request(room_number, request_description): Guest needs something (e.g. extra towels).
-    - view_guest_requests(): User asks to see open requests.
-    - close_guest_request(ticket_id): User wants to close a ticket.
-    
-    REPORTING
-    - get_all_guests(): List all current guests.
-    - get_revenue_by_date(date): Revenue for a specific date (rooms occupied that night).
-    - get_occupancy_rate(date): How full the hotel is on a given date.
-    - get_top_booking_source(): Which platform generates the most revenue.
-    
-    ROOM TYPES
-    - list_room_types(): User asks what room categories exist or their rates.
-    
-    BOOKING SOURCES
-    - list_booking_sources(): User asks what platforms or channels are used for bookings.
-    
-    MEMORY BEHAVIOR
-    - Reuse the last mentioned room_number, guest_name, check_in_date, check_out_date across turns.
-    - Map pronouns like "it", "that", or "again" to the most recent relevant context.
-    
-    DATE INTERPRETATION
-    - If the year is missing, assume current year if the date is in the future, next year if it has already passed.
-    - Ask for clarification if the date is genuinely ambiguous.
-    
-    GENERAL BEHAVIOR
-    - Use only tool outputs. Never invent data.
-    - Keep responses concise, factual, and clear.
-    """
+# ChatPromptTemplate lets us inject {today} fresh on every invoke call
+# without it ever being stored in MemorySaver's message history.
+# {messages} is required — it's the placeholder where LangGraph inserts
+# the full conversation history per thread.
+prompt = ChatPromptTemplate.from_messages([
+    (
+        "system",
+        """You are a reliable assistant helping a hotel manager manage bookings, guest services, and reporting.
+You respond naturally and map user requests to the appropriate tool using only factual data — never fabricate.
+
+Today's date is {today}. Use this when interpreting relative terms like "today", "tomorrow", \
+"next Friday", "this weekend", or "next week".
+
+Respond in plain text (no emojis, no markdown). Format all dates conversationally (e.g. 5th April 2026).
+
+TOOLS AND WHEN TO USE THEM
+
+ROOM BOOKING
+- check_room_availability(check_in_date, check_out_date): User asks about available rooms for a date range.
+- book_room(guest_name, room_number, check_in_date, check_out_date): User wants to book a room.
+- get_room_details(room_number): User asks about a specific room's status or type.
+
+GUEST REQUESTS
+- raise_guest_request(room_number, request_description): Guest needs something (e.g. extra towels).
+- view_guest_requests(): User asks to see all open requests.
+- close_guest_request(ticket_id): User wants to close a specific ticket.
+
+REPORTING
+- get_all_guests(): List all guests from booking records.
+- get_revenue_by_date(query_date): Revenue for rooms occupied on a specific night.
+- get_occupancy_rate(query_date): How full the hotel is on a given date.
+- get_top_booking_source(): Which booking platform generates the most revenue.
+
+ROOM TYPES
+- list_room_types(): User asks what room categories exist or their nightly rates.
+
+BOOKING SOURCES
+- list_booking_sources(): User asks what platforms or channels are used for bookings.
+
+MEMORY BEHAVIOR
+- Reuse the last mentioned room_number, guest_name, check_in_date, check_out_date across turns.
+- Map pronouns like "it", "that", or "again" to the most recent relevant context.
+
+DATE INTERPRETATION
+- Always resolve relative dates using today's date provided above.
+- If the year is missing from an explicit date, assume the current year if the date is in the future,
+  otherwise assume next year.
+- Ask for clarification only if the date is genuinely ambiguous.
+
+GENERAL BEHAVIOR
+- Use only tool outputs. Never invent data.
+- Keep responses concise, factual, and clear.
+""",
+    ),
+    ("placeholder", "{messages}"),  # LangGraph injects full conversation history here
+])
 
 agent_executor = create_react_agent(
     llm,
     tools,
-    prompt=SYSTEM_PROMPT,
+    prompt=prompt,
     checkpointer=memory,
     debug=False,
 )
@@ -692,10 +705,8 @@ agent_executor = create_react_agent(
 def sanitize_message_history(config: dict) -> None:
     """
     Remove any AIMessages with tool_calls that have no matching ToolMessage.
-    This prevents INVALID_CHAT_HISTORY errors caused by interrupted tool executions.
+    Prevents INVALID_CHAT_HISTORY errors caused by interrupted tool executions.
     """
-    from langchain_core.messages import AIMessage, ToolMessage
-
     checkpoint = memory.get(config)
     if not checkpoint:
         return
@@ -760,7 +771,7 @@ def ask_agent(user_input: str, session_id: str) -> dict:
         response = agent_executor.invoke(
             {
                 "messages": [{"role": "user", "content": user_input}],
-                "system": get_system_prompt(),   # ✅ fresh date every call
+                "today": datetime.now().strftime("%A, %d %B %Y"),  # e.g. "Sunday, 05 April 2026"
             },
             config=config,
         )
